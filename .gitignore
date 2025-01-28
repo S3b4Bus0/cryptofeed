@@ -1,4 +1,5 @@
 .vscode/
+Pipfile.lock
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -7,6 +8,7 @@ __pycache__/
 
 # C extensions
 *.so
+cryptofeed/types.c
 
 # Distribution / packaging
 .Python
@@ -25,7 +27,8 @@ var/
 wheels/
 *.egg-info/
 .installed.cfg
-*.egg
+*.egg*
+wheelhouse/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

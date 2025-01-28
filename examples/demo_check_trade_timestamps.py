@@ -4,7 +4,6 @@ import time
 from datetime import datetime
 
 from cryptofeed import FeedHandler
-from cryptofeed.callback import TradeCallback
 from cryptofeed.defines import TRADES
 
 
@@ -29,7 +28,7 @@ Starting: 1562808668.105481
 [12]: Subscribing to OKCoin
 [13]: Subscribing to OKEx
 [14]: Subscribing to Poloniex
-Added OKEX.
+Added OKX.
 Added EXX.
 Added OKCOIN.
 Added HUOBI.
@@ -57,18 +56,19 @@ HITBTC      : timestamp:1562808491.473       <class 'float'> 2019-07-11 09:28:11
 HUOBI       : timestamp:1562808675.644       <class 'float'> 2019-07-11 09:31:15.644000
 KRAKEN      : timestamp:1562808676.238593    <class 'float'> 2019-07-11 09:31:16.238593
 OKCOIN      : timestamp:1562808671.739       <class 'float'> 2019-07-11 09:31:11.739000
-OKEX        : timestamp:1562808675.317       <class 'float'> 2019-07-11 09:31:15.317000
+OKX        : timestamp:1562808675.317       <class 'float'> 2019-07-11 09:31:15.317000
 POLONIEX    : timestamp:1562808726.0         <class 'float'> 2019-07-11 09:32:06
 Ending: 1562808727.693259
 '''
 
 
-async def trade(feed, symbol, order_id, timestamp, receipt_timestamp, side, amount, price):
-    if feed not in trades:
-        print(f'Added {feed}.')
+async def trade(data, receipt):
+    exchange = data.exchange
+    if exchange not in trades:
+        print(f'Added {exchange}.')
         # exch_count += 1
-        trades[feed]['timestamp'] = timestamp
-        trades[feed]['order_id'] = order_id
+        trades[exchange]['timestamp'] = data.timestamp
+        trades[exchange]['id'] = data.id
         if exchanges == set(trades.keys()):
             for e in sorted(exchanges):
                 ts = trades[e]['timestamp']
@@ -86,18 +86,17 @@ def main():
     exch_sym_map = {}
     exch_sym_map['Binance'] = ['BTC-USDT', 'BTC-USDC', 'BTC-TUSD']
     exch_sym_map['Bitfinex'] = ['BTC-USD']
-    exch_sym_map['BitMEX'] = ['BTC-USD']
+    exch_sym_map['BitMEX'] = ['BTC-USD-PERP']
     exch_sym_map['Bitstamp'] = ['BTC-USD']
-    exch_sym_map['Bybit'] = ['BTC-USD']
+    exch_sym_map['Bybit'] = ['BTC-USD-PERP']
     exch_sym_map['Coinbase'] = ['BTC-USD']
-    exch_sym_map['Deribit'] = ['BTC-USD-PERPETUAL']
-    exch_sym_map['EXX'] = ['BTC-USDT']
+    exch_sym_map['Deribit'] = ['BTC-USD-PERP']
     exch_sym_map['Gemini'] = ['BTC-USD']
-    exch_sym_map['HitBTC'] = ['BTC-USD']
+    exch_sym_map['HitBTC'] = ['BTC-USDT']
     exch_sym_map['Huobi'] = ['BTC-USDT']
     exch_sym_map['Kraken'] = ['BTC-USD']
     exch_sym_map['OKCoin'] = ['BTC-USD']
-    exch_sym_map['OKEx'] = ['BTC-USDT']
+    exch_sym_map['OKX'] = ['BTC-USDT']
     exch_sym_map['Poloniex'] = ['BTC-USDT']
 
     global exchanges
@@ -107,10 +106,7 @@ def main():
     f = FeedHandler()
     for i, e in enumerate(exch_sym_map):
         print(f'{[i]}: Subscribing to {e}')
-        if e == 'Gemini':
-            f.add_feed(e.upper(), symbols=exch_sym_map[e], callbacks={TRADES: TradeCallback(trade)})
-        else:
-            f.add_feed(e.upper(), symbols=exch_sym_map[e], channels=channels, callbacks={TRADES: TradeCallback(trade)})
+        f.add_feed(e.upper(), symbols=exch_sym_map[e], channels=channels, callbacks={TRADES: trade})
     f.run()
 
 
