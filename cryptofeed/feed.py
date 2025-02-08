@@ -1,40 +1,35 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2025 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
+import asyncio
 from collections import defaultdict
-from functools import partial
 import logging
-import os
-from typing import Dict, Tuple, Callable, Union, List
+from typing import Tuple, Callable, List, Union
 
-from cryptofeed.symbols import Symbols
+from aiohttp.typedefs import StrOrURL
+
 from cryptofeed.callback import Callback
-from cryptofeed.config import Config
-from cryptofeed.connection import AsyncConnection, HTTPAsyncConn, HTTPSync, WSAsyncConn
+from cryptofeed.connection import AsyncConnection, HTTPAsyncConn, WSAsyncConn
 from cryptofeed.connection_handler import ConnectionHandler
-from cryptofeed.defines import (ASK, BID, BOOK_DELTA, CANDLES, FUNDING, FUTURES_INDEX, L2_BOOK, L3_BOOK, LIQUIDATIONS,
-                                OPEN_INTEREST, MARKET_INFO, ORDER_INFO, TICKER, TRADES)
-from cryptofeed.exceptions import BidAskOverlapping, UnsupportedDataFeed, UnsupportedSymbol
-from cryptofeed.standards import feed_to_exchange, is_authenticated_channel
-from cryptofeed.util.book import book_delta, depth
+from cryptofeed.defines import BALANCES, CANDLES, FUNDING, INDEX, L2_BOOK, L3_BOOK, LIQUIDATIONS, OPEN_INTEREST, ORDER_INFO, POSITIONS, TICKER, TRADES, FILLS
+from cryptofeed.exceptions import BidAskOverlapping
+from cryptofeed.exchange import Exchange
+from cryptofeed.types import OrderBook
 
 
 LOG = logging.getLogger('feedhandler')
 
 
-class Feed:
-    id = 'NotImplemented'
-    http_sync = HTTPSync()
-
-    def __init__(self, address: Union[dict, str], timeout=120, timeout_interval=30, retries=10, symbols=None, channels=None, subscription=None, config: Union[Config, dict, str] = None, callbacks=None, max_depth=None, book_interval=1000, snapshot_interval=False, checksum_validation=False, cross_check=False, origin=None, exceptions=None, log_message_on_error=False, sandbox=False):
+class Feed(Exchange):
+    def __init__(self, candle_interval='1m', candle_closed_only=True, timeout=120, timeout_interval=30, retries=10, symbols=None, channels=None, subscription=None, callbacks=None, max_depth=0, checksum_validation=False, cross_check=False, exceptions=None, log_message_on_error=False, delay_start=0, http_proxy: StrOrURL = None, **kwargs):
         """
-        address: str, or dict
-            address to be used to create the connection.
-            The address protocol (wss or https) will be used to determine the connection type.
-            Use a "str" to pass one single address, or a dict of option/address
+        candle_interval: str
+            the candle interval. See the specific exchange to see what intervals they support
+        candle_closed_only: bool
+            returns only closed/completed candles (if supported by exchange).
         timeout: int
             Time, in seconds, between message to wait before a feed is considered dead and will be restarted.
             Set to -1 for infinite.
@@ -42,39 +37,30 @@ class Feed:
             Time, in seconds, between timeout checks.
         retries: int
             Number of times to retry a failed connection. Set to -1 for infinite
+        symbols: list of str, Symbol
+            A list of instrument symbols. Symbols must be of type str or Symbol
         max_depth: int
-            Maximum number of levels per side to return in book updates
-        book_interval: int
-            Number of updates between snapshots. Only applicable when book deltas are enabled.
-            Book deltas are enabled by subscribing to the book delta callback.
-        snapshot_interval: bool/int
-            Number of updates between snapshots. Only applicable when book delta is not enabled.
-            Updates between snapshots are not delivered to the client
+            Maximum number of levels per side to return in book updates. 0 is the default, and indicates no trimming of levels should be performed.
+        candle_interval: str
+            Length of time between a candle's Open and Close. Valid on exchanges with support for candles
         checksum_validation: bool
             Toggle checksum validation, when supported by an exchange.
         cross_check: bool
             Toggle a check for a crossed book. Should not be needed on exchanges that support
             checksums or provide message sequence numbers.
-        origin: str
-            Passed into websocket connect. Sets the origin header.
         exceptions: list of exceptions
             These exceptions will not be handled internally and will be passed to the asyncio exception handler. To
             handle them feedhandler will need to be supplied with a custom exception handler. See the `run` method
             on FeedHandler, specifically the `exception_handler` keyword argument.
         log_message_on_error: bool
             If an exception is encountered in the connection handler, log the raw message
-        sandbox: bool
-            enable sandbox mode for exchanges that support this
+        delay_start: int, float
+            a delay before starting the feed/connection to the exchange. If you are subscribing to a large number of feeds
+            on a single exchange, you may encounter 429s. You can use this to stagger the starts.
+        http_proxy: str
+            URL of proxy server. Passed to HTTPPoll and HTTPAsyncConn. Only used for HTTP GET requests.
         """
-        if isinstance(config, Config):
-            LOG.info('%s: reuse object Config containing the following main keys: %s', self.id, ", ".join(config.config.keys()))
-            self.config = config
-        else:
-            LOG.info('%s: create Config from type: %r', self.id, type(config))
-            self.config = Config(config)
-
-        self.sandbox = sandbox
-
+        super().__init__(**kwargs)
         self.log_on_error = log_message_on_error
         self.retries = retries
         self.exceptions = exceptions
@@ -82,247 +68,203 @@ class Feed:
         self.timeout = timeout
         self.timeout_interval = timeout_interval
         self.subscription = defaultdict(set)
-        self.address = address
-        self.book_update_interval = book_interval
-        self.snapshot_interval = snapshot_interval
         self.cross_check = cross_check
-        self.updates = defaultdict(int)
-        self.do_deltas = False
         self.normalized_symbols = []
         self.max_depth = max_depth
         self.previous_book = defaultdict(dict)
-        self.origin = origin
         self.checksum_validation = checksum_validation
-        self.ws_defaults = {'ping_interval': 10, 'ping_timeout': None, 'max_size': 2**23, 'max_queue': None, 'origin': self.origin}
-        self.key_id = os.environ.get(f'CF_{self.id}_KEY_ID') or self.config[self.id.lower()].key_id
-        self.key_secret = os.environ.get(f'CF_{self.id}_KEY_SECRET') or self.config[self.id.lower()].key_secret
-        self.key_passphrase = os.environ.get(f'CF_{self.id}_KEY_PASSWORD') or self.config[self.id.lower()].key_passphrase
+        self.requires_authentication = False
         self._feed_config = defaultdict(list)
-        self.http_conn = HTTPAsyncConn(self.id)
+        self.http_conn = HTTPAsyncConn(self.id, http_proxy)
+        self.http_proxy = http_proxy
+        self.start_delay = delay_start
+        self.candle_interval = candle_interval
+        self.candle_closed_only = candle_closed_only
+        self._sequence_no = {}
 
-        symbols_cache = Symbols
-        if not symbols_cache.populated(self.id):
-            self.symbol_mapping()
+        if self.valid_candle_intervals != NotImplemented:
+            if candle_interval not in self.valid_candle_intervals:
+                raise ValueError(f"Candle interval must be one of {self.valid_candle_intervals}")
 
-        self.normalized_symbol_mapping, self.exchange_info = symbols_cache.get(self.id)
-        self.exchange_symbol_mapping = {value: key for key, value in self.normalized_symbol_mapping.items()}
+        if self.candle_interval_map != NotImplemented:
+            self.normalize_candle_interval = {value: key for key, value in self.candle_interval_map.items()}
 
         if subscription is not None and (symbols is not None or channels is not None):
             raise ValueError("Use subscription, or channels and symbols, not both")
 
         if subscription is not None:
             for channel in subscription:
-                chan = feed_to_exchange(self.id, channel)
-                if is_authenticated_channel(channel):
+                chan = self.std_channel_to_exchange(channel)
+                if self.is_authenticated_channel(channel):
                     if not self.key_id or not self.key_secret:
                         raise ValueError("Authenticated channel subscribed to, but no auth keys provided")
+                    self.requires_authentication = True
                 self.normalized_symbols.extend(subscription[channel])
                 self.subscription[chan].update([self.std_symbol_to_exchange_symbol(symbol) for symbol in subscription[channel]])
                 self._feed_config[channel].extend(self.normalized_symbols)
 
         if symbols and channels:
-            if any(is_authenticated_channel(chan) for chan in channels):
+            if any(self.is_authenticated_channel(chan) for chan in channels):
                 if not self.key_id or not self.key_secret:
                     raise ValueError("Authenticated channel subscribed to, but no auth keys provided")
+                self.requires_authentication = True
 
             # if we dont have a subscription dict, we'll use symbols+channels and build one
             [self._feed_config[channel].extend(symbols) for channel in channels]
             self.normalized_symbols = symbols
+            self.normalized_channels = channels
 
             symbols = [self.std_symbol_to_exchange_symbol(symbol) for symbol in symbols]
-            channels = list(set([feed_to_exchange(self.id, chan) for chan in channels]))
+            channels = list(set([self.std_channel_to_exchange(chan) for chan in channels]))
             self.subscription = {chan: symbols for chan in channels}
 
         self._feed_config = dict(self._feed_config)
+        self._auth_token = None
 
-        self.l3_book = {}
-        self.l2_book = {}
+        self._l3_book = {}
+        self._l2_book = {}
         self.callbacks = {FUNDING: Callback(None),
-                          FUTURES_INDEX: Callback(None),
+                          INDEX: Callback(None),
                           L2_BOOK: Callback(None),
                           L3_BOOK: Callback(None),
                           LIQUIDATIONS: Callback(None),
                           OPEN_INTEREST: Callback(None),
-                          MARKET_INFO: Callback(None),
                           TICKER: Callback(None),
                           TRADES: Callback(None),
                           CANDLES: Callback(None),
-                          ORDER_INFO: Callback(None)
+                          ORDER_INFO: Callback(None),
+                          FILLS: Callback(None),
+                          BALANCES: Callback(None),
+                          POSITIONS: Callback(None)
                           }
 
         if callbacks:
             for cb_type, cb_func in callbacks.items():
                 self.callbacks[cb_type] = cb_func
-                if cb_type == BOOK_DELTA:
-                    self.do_deltas = True
 
         for key, callback in self.callbacks.items():
             if not isinstance(callback, list):
                 self.callbacks[key] = [callback]
 
-    def _connect_builder(self, address: str, options: list, header=None, sub=None, handler=None):
+    def _connect_rest(self):
         """
-        Helper method for building a custom connect tuple
+        Child classes should override this method to generate connection objects that
+        support their polled REST endpoints.
         """
-        subscribe = partial(self.subscribe if not sub else sub, options=options)
-        conn = WSAsyncConn(address, self.id, extra_headers=header, **self.ws_defaults)
-        return conn, subscribe, handler if handler else self.message_handler
-
-    async def _empty_subscribe(self, conn: AsyncConnection, **kwargs):
-        return
+        return []
 
     def connect(self) -> List[Tuple[AsyncConnection, Callable[[None], None], Callable[[str, float], None]]]:
         """
-        Generic connection method for exchanges. Exchanges that require/support
-        multiple addresses will need to override this method in their specific class
-        unless they use the same subscribe method and message handler for all
-        connections.
+        Generic websocket connection method for exchanges. Uses the websocket endpoints defined in the
+        exchange to determine, based on the subscription information, which endpoints should be used,
+        and what instruments/channels should be enabled on each connection.
 
         Connect returns a list of tuples. Each tuple contains
         1. an AsyncConnection object
         2. the subscribe function pointer associated with this connection
         3. the message handler for this connection
+        4. The authentication method for this connection
         """
-        ret = []
-        if isinstance(self.address, str):
-            return [(WSAsyncConn(self.address, self.id, **self.ws_defaults), self.subscribe, self.message_handler)]
+        def limit_sub(subscription: dict, limit: int, auth, options: dict):
+            ret = []
+            sub = {}
+            for channel in subscription:
+                for pair in subscription[channel]:
+                    if channel not in sub:
+                        sub[channel] = []
+                    sub[channel].append(pair)
+                    if sum(map(len, sub.values())) == limit:
+                        ret.append((WSAsyncConn(addr, self.id, authentication=auth, subscription=sub, **options), self.subscribe, self.message_handler, self.authenticate))
+                        sub = {}
 
-        for _, addr in self.address.items():
-            ret.append((WSAsyncConn(addr, self.id, **self.ws_defaults), self.subscribe, self.message_handler))
+            if sum(map(len, sub.values())) > 0:
+                ret.append((WSAsyncConn(addr, self.id, authentication=auth, subscription=sub, **options), self.subscribe, self.message_handler, self.authenticate))
+            return ret
+
+        ret = self._connect_rest()
+        for endpoint in self.websocket_endpoints:
+            auth = None
+            if endpoint.authentication:
+                # if a class has an endpoint with the authentication flag set to true, this
+                # method must be define. The method will be called immediately before connecting
+                # to authenticate the connection. _ws_authentication returns a tuple of address and ws options
+                auth = self._ws_authentication
+            limit = endpoint.limit
+            addr = self._address()
+            addr = endpoint.get_address(self.sandbox) if addr is None else addr
+            if not addr:
+                continue
+
+            # filtering can only be done on normalized symbols, but this subscription needs to have the raw/exchange specific
+            # subscription, so we need to temporarily convert the symbols back and forth. It has to be done here
+            # while in the context of the class
+            temp_sub = {chan: [self.exchange_symbol_to_std_symbol(s) for s in symbols] for chan, symbols in self.subscription.items()}
+            filtered_sub = {chan: [self.std_symbol_to_exchange_symbol(s) for s in symbols] for chan, symbols in endpoint.subscription_filter(temp_sub).items()}
+            count = sum(map(len, filtered_sub.values()))
+
+            if not self.allow_empty_subscriptions and (not filtered_sub or count == 0):
+                continue
+            if limit and count > limit:
+                ret.extend(limit_sub(filtered_sub, limit, auth, endpoint.options))
+            else:
+                if isinstance(addr, list):
+                    for add in addr:
+                        ret.append((WSAsyncConn(add, self.id, authentication=auth, subscription=filtered_sub, **endpoint.options), self.subscribe, self.message_handler, self.authenticate))
+                else:
+                    ret.append((WSAsyncConn(addr, self.id, authentication=auth, subscription=filtered_sub, **endpoint.options), self.subscribe, self.message_handler, self.authenticate))
+
         return ret
 
-    @classmethod
-    def info(cls) -> dict:
-        """
-        Return information about the Exchange - what trading symbols are supported, what data channels, etc
+    def _ws_authentication(self, address: str, ws_options: dict) -> Tuple[str, dict]:
+        '''
+        Used to do authentication immediately before connecting. Takes the address and the websocket options as
+        arguments and returns a new address and new websocket options that will be used to connect.
+        '''
+        raise NotImplementedError
 
-        key_id: str
-            API key to query the feed, required when requesting supported coins/symbols.
-        """
-        symbols = cls.symbol_mapping()
-        data = Symbols.get(cls.id)[1]
-        data['symbols'] = list(symbols.keys())
-        data['channels'] = []
-        for channel in (FUNDING, FUTURES_INDEX, LIQUIDATIONS, L2_BOOK, L3_BOOK, OPEN_INTEREST, MARKET_INFO, TICKER, TRADES, CANDLES):
-            try:
-                feed_to_exchange(cls.id, channel, silent=True)
-                data['channels'].append(channel)
-            except UnsupportedDataFeed:
-                pass
+    def _address(self):
+        '''
+        If you need to dynamically calculate the address before connecting, overload this method in the exchange object.
+        '''
+        return None
 
-        return data
-
-    @classmethod
-    def symbols(cls, refresh=False) -> dict:
-        if refresh:
-            cls.symbol_mapping(refresh=True)
-        return cls.info()['symbols']
-
-    @classmethod
-    def symbol_mapping(cls, symbol_separator='-', refresh=False) -> Dict:
-        if Symbols.populated(cls.id) and not refresh:
-            return Symbols.get(cls.id)[0]
-        try:
-            LOG.debug("%s: reading symbol information from %s", cls.id, cls.symbol_endpoint)
-            if isinstance(cls.symbol_endpoint, list):
-                data = []
-                for ep in cls.symbol_endpoint:
-                    data.append(cls.http_sync.read(ep, json=True, uuid=cls.id))
-            else:
-                data = cls.http_sync.read(cls.symbol_endpoint, json=True, uuid=cls.id)
-            syms, info = cls._parse_symbol_data(data, symbol_separator)
-            Symbols.set(cls.id, syms, info)
-            return syms
-        except Exception as e:
-            LOG.error("%s: Failed to parse symbol information: %s", cls.id, str(e), exc_info=True)
-            raise
-
-    async def book_callback(self, book: dict, book_type: str, symbol: str, forced: bool, delta: dict, timestamp: float, receipt_timestamp: float):
-        """
-        Three cases we need to handle here
-
-        1.  Book deltas are enabled (application of max depth here is trivial)
-        1a. Book deltas are enabled, max depth is not, and exchange does not support deltas. Rare
-        2.  Book deltas not enabled, but max depth is enabled
-        3.  Neither deltas nor max depth enabled
-        4.  Book deltas disabled and snapshot intervals enabled (with/without max depth)
-
-        2 and 3 can be combined into a single block as long as application of depth modification
-        happens first
-
-        For 1, need to handle separate cases where a full book is returned vs a delta
-        """
-        if self.do_deltas:
-            if not forced and self.updates[symbol] < self.book_update_interval:
-                if self.max_depth:
-                    delta, book = await self.apply_depth(book, True, symbol)
-                    if not (delta[BID] or delta[ASK]):
-                        return
-                elif not delta:
-                    # this will only happen in cases where an exchange does not support deltas and max depth is not enabled.
-                    # this is an uncommon situation. Exchanges that do not support deltas will need
-                    # to populate self.previous internally to avoid the unncesessary book copy on all other exchanges
-                    delta = book_delta(self.previous_book[symbol], book, book_type=book_type)
-                    if not (delta[BID] or delta[ASK]):
-                        return
-                self.updates[symbol] += 1
-                if self.cross_check:
-                    self.check_bid_ask_overlapping(book, symbol)
-                await self.callback(BOOK_DELTA, feed=self.id, symbol=symbol, delta=delta, timestamp=timestamp, receipt_timestamp=receipt_timestamp)
-                if self.updates[symbol] != self.book_update_interval:
-                    return
-            elif forced and self.max_depth:
-                # We want to send a full book update but need to apply max depth first
-                _, book = await self.apply_depth(book, False, symbol)
-        elif self.max_depth:
-            if not self.snapshot_interval or (self.snapshot_interval and self.updates[symbol] >= self.snapshot_interval):
-                changed, book = await self.apply_depth(book, False, symbol)
-                if not changed:
-                    return
-        # case 4 - increment skipped update, and exit
-        if self.snapshot_interval and self.updates[symbol] < self.snapshot_interval:
-            self.updates[symbol] += 1
+    @property
+    def address(self) -> Union[List, str]:
+        if len(self.websocket_endpoints) == 0:
             return
+        addrs = [ep.get_address(sandbox=self.sandbox) for ep in self.websocket_endpoints]
+        return addrs[0] if len(addrs) == 1 else addrs
 
+    async def book_callback(self, book_type: str, book: OrderBook, receipt_timestamp: float, timestamp=None, raw=None, sequence_number=None, checksum=None, delta=None):
         if self.cross_check:
-            self.check_bid_ask_overlapping(book, symbol)
-        if book_type == L2_BOOK:
-            await self.callback(L2_BOOK, feed=self.id, symbol=symbol, book=book, timestamp=timestamp, receipt_timestamp=receipt_timestamp)
-        else:
-            await self.callback(L3_BOOK, feed=self.id, symbol=symbol, book=book, timestamp=timestamp, receipt_timestamp=receipt_timestamp)
-        self.updates[symbol] = 0
+            self.check_bid_ask_overlapping(book)
 
-    def check_bid_ask_overlapping(self, book, symbol):
-        bid, ask = book[BID], book[ASK]
+        book.timestamp = timestamp
+        book.raw = raw
+        book.sequence_number = sequence_number
+        book.delta = delta
+        book.checksum = checksum
+        await self.callback(book_type, book, receipt_timestamp)
+
+    def check_bid_ask_overlapping(self, data):
+        bid, ask = data.book.bids, data.book.asks
         if len(bid) > 0 and len(ask) > 0:
-            best_bid, best_ask = bid.keys()[-1], ask.keys()[0]
+            best_bid, best_ask = bid.index(0)[0], ask.index(0)[0]
             if best_bid >= best_ask:
-                raise BidAskOverlapping(f"{self.id} {symbol} best bid {best_bid} >= best ask {best_ask}")
+                raise BidAskOverlapping(f"{self.id} - {data.symbol}: best bid {best_bid} >= best ask {best_ask}")
 
-    async def callback(self, data_type, **kwargs):
+    async def callback(self, data_type, obj, receipt_timestamp):
         for cb in self.callbacks[data_type]:
-            await cb(**kwargs)
-
-    async def apply_depth(self, book: dict, do_delta: bool, symbol: str):
-        ret = depth(book, self.max_depth)
-        if not do_delta:
-            delta = self.previous_book[symbol] != ret
-            self.previous_book[symbol] = ret
-            return delta, ret
-
-        delta = book_delta(self.previous_book[symbol], ret)
-        self.previous_book[symbol] = ret
-        return delta, ret
+            await cb(obj, receipt_timestamp)
 
     async def message_handler(self, msg: str, conn: AsyncConnection, timestamp: float):
         raise NotImplementedError
 
-    async def subscribe(self, connection: AsyncConnection, **kwargs):
-        """
-        kwargs will not be passed from anywhere, if you need to supply extra data to
-        your subscribe, bind the data to the method with a partial
-        """
+    async def subscribe(self, connection: AsyncConnection):
         raise NotImplementedError
+
+    async def authenticate(self, connection: AsyncConnection):
+        pass
 
     async def shutdown(self):
         LOG.info('%s: feed shutdown starting...', self.id)
@@ -331,8 +273,7 @@ class Feed:
         for callbacks in self.callbacks.values():
             for callback in callbacks:
                 if hasattr(callback, 'stop'):
-                    cb_name = callback.__class__.__name__ if hasattr(callback, '__class__') else callback.__name__
-                    LOG.info('%s: stopping backend %s', self.id, cb_name)
+                    LOG.info('%s: stopping backend %s', self.id, self.backend_name(callback))
                     await callback.stop()
         for c in self.connection_handlers:
             await c.conn.close()
@@ -342,30 +283,24 @@ class Feed:
         for c in self.connection_handlers:
             c.running = False
 
-    def start(self, loop):
+    def start(self, loop: asyncio.AbstractEventLoop):
         """
         Create tasks for exchange interfaces and backends
         """
-        for conn, sub, handler in self.connect():
-            self.connection_handlers.append(ConnectionHandler(conn, sub, handler, self.retries, exceptions=self.exceptions, log_on_error=self.log_on_error))
+        for conn, sub, handler, auth in self.connect():
+            self.connection_handlers.append(ConnectionHandler(conn, sub, handler, auth, self.retries, timeout=self.timeout, timeout_interval=self.timeout_interval, exceptions=self.exceptions, log_on_error=self.log_on_error, start_delay=self.start_delay))
             self.connection_handlers[-1].start(loop)
 
         for callbacks in self.callbacks.values():
             for callback in callbacks:
                 if hasattr(callback, 'start'):
-                    cb_name = callback.__class__.__name__ if hasattr(callback, '__class__') else callback.__name__
-                    LOG.info('%s: starting backend task %s', self.id, cb_name)
+                    LOG.info('%s: starting backend task %s with multiprocessing=%s', self.id, self.backend_name(callback), 'True' if self.config.backend_multiprocessing else 'False')
                     # Backends start tasks to write messages
-                    callback.start(loop)
+                    callback.start(loop, multiprocess=self.config.backend_multiprocessing)
 
-    def exchange_symbol_to_std_symbol(self, symbol: str) -> str:
-        try:
-            return self.exchange_symbol_mapping[symbol]
-        except KeyError:
-            raise UnsupportedSymbol(f'{symbol} is not supported on {self.id}')
-
-    def std_symbol_to_exchange_symbol(self, symbol: str) -> str:
-        try:
-            return self.normalized_symbol_mapping[symbol]
-        except KeyError:
-            raise UnsupportedSymbol(f'{symbol} is not supported on {self.id}')
+    def backend_name(self, callback):
+        if hasattr(callback, '__class__'):
+            if hasattr(callback, 'handler'):
+                return callback.handler.__class__.__name__ + "+" + callback.__class__.__name__
+            return callback.__class__.__name__
+        return callback.__name__

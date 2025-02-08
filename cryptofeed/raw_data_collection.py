@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2025 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -9,11 +9,11 @@ import atexit
 from collections import defaultdict
 import functools
 import ast
-import json
 
+from yapic import json
 from aiofile import AIOFile
 
-from cryptofeed.defines import HUOBI, UPBIT, OKEX, OKCOIN
+from cryptofeed.defines import HUOBI, UPBIT, OKX, OKCOIN
 from cryptofeed.exchanges import EXCHANGE_MAP
 
 
@@ -22,12 +22,12 @@ def bytes_string_to_bytes(string):
     return tree.body[0].value.s
 
 
-def playback(feed: str, filenames: list):
-    return asyncio.run(_playback(feed, filenames))
+def playback(feed: str, filenames: list, callbacks: dict = None, config: str = 'config.yaml'):
+    return asyncio.run(_playback(feed, filenames, callbacks, config))
 
 
-async def _playback(feed: str, filenames: list):
-    callbacks = defaultdict(int)
+async def _playback(feed: str, filenames: list, callbacks: dict, config: str):
+    callback_stats = defaultdict(int)
 
     class FakeWS:
         def __init__(self, filenames):
@@ -37,7 +37,7 @@ async def _playback(feed: str, filenames: list):
 
             for filename in filenames:
                 if 'http' in filename:
-                    with open(filename, 'r') as fp:
+                    with open(filename, 'r', encoding='utf-8') as fp:
                         for line in fp.readlines():
                             if line.startswith('http'):
                                 file_url, data = line.split(' -> ')
@@ -62,10 +62,11 @@ async def _playback(feed: str, filenames: list):
         if 'ws' not in f and 'http' not in f:
             exchange = f.rsplit("/", 1)[1]
             exchange = exchange.split(".", 1)[0]
-            with open(f, 'r') as fp:
+            with open(f, 'r', encoding='utf-8') as fp:
                 for line in fp.readlines():
                     if 'configuration' in line:
                         sub = json.loads(line.split(": ", 1)[1])
+                        ws.subscription = sub
                     if line == "\n":
                         continue
                     line = line.split(": ", 1)[1]
@@ -82,14 +83,23 @@ async def _playback(feed: str, filenames: list):
     HTTPSync.read = symbol_helper
 
     async def internal_cb(*args, **kwargs):
-        callbacks[kwargs['cb_type']] += 1
+        callback_stats[kwargs['cb_type']] += 1
 
-    feed = EXCHANGE_MAP[feed](config="config.yaml", subscription=sub)
-    for cb_type, handler in feed.callbacks.items():
-        f = functools.partial(internal_cb, cb_type=cb_type)
-        handler.append(f)
+    if not callbacks:
+        callbacks = {ctype: functools.partial(internal_cb, cb_type=ctype) for ctype in sub.keys()}
+    else:
+        for ctype in callbacks.keys():
+            callbacks[ctype] = [callbacks[ctype], functools.partial(internal_cb, cb_type=ctype)]
+    feed = EXCHANGE_MAP[feed](candle_closed_only=False, config=config, subscription=sub, callbacks=callbacks)
 
-    for _, sub, handler in feed.connect():
+    exchange_sub = {}
+    for chan in ws.subscription:
+        c = feed.std_channel_to_exchange(chan)
+        s = [feed.std_symbol_to_exchange_symbol(s) for s in sub[chan]]
+        exchange_sub[c] = s
+    ws.subscription = exchange_sub
+
+    for _, sub, handler, auth in feed.connect():
         await sub(ws)
 
     counter = 0
@@ -110,7 +120,7 @@ async def _playback(feed: str, filenames: list):
                     timestamp, message = line.split(": ", 1)
                     counter += 1
 
-                    if OKCOIN in filename or OKEX in filename:
+                    if OKCOIN in filename or OKX in filename:
                         if message.startswith('b\'') or message.startswith('b"'):
                             message = bytes_string_to_bytes(message)
                     elif HUOBI in filename:
@@ -122,13 +132,15 @@ async def _playback(feed: str, filenames: list):
                     await handler(message, ws, timestamp)
                 except Exception:
                     print("Playback failed on message:", message)
+                    feed.stop()
+                    await feed.shutdown()
                     raise
     feed.stop()
     await feed.shutdown()
 
     HTTPAsyncConn.read = http_async_conn_read
     HTTPSync.read = http_sync_read
-    return {'messages_processed': counter, 'callbacks': dict(callbacks)}
+    return {'messages_processed': counter, 'callbacks': dict(callback_stats)}
 
 
 class AsyncFileCallback:
@@ -173,6 +185,7 @@ class AsyncFileCallback:
             if header:
                 self.data[uuid].append(f"{endpoint} -> {timestamp}: {data} header: {json.dumps(header)}")
             else:
+                data = data.replace("\n", "")
                 self.data[uuid].append(f"{endpoint} -> {timestamp}: {data}")
         elif send:
             self.data[uuid].append(f"{send} <- {timestamp}: {data}")
@@ -189,6 +202,7 @@ class AsyncFileCallback:
             if header:
                 w = w = f"{endpoint} -> {timestamp}: {data} header: {json.dumps(header)}"
             else:
+                data = data.replace("\n", "")
                 w = f"{endpoint} -> {timestamp}: {data}"
         elif send:
             w = f"{send} <- {timestamp}: {data}"

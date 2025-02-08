@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2018-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2018-2025 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -37,7 +37,7 @@ def main():
         p.start()
 
         f = FeedHandler()
-        f.add_feed(Kraken(max_depth=1, channels=[L2_BOOK], symbols=['ETH-USD'], callbacks={L2_BOOK: BookZMQ(port=5678)}))
+        f.add_feed(Kraken(max_depth=2, channels=[L2_BOOK], symbols=['ETH-USD', 'BTC-USD'], callbacks={L2_BOOK: BookZMQ(snapshots_only=False, snapshot_interval=2, port=5678)}))
         f.add_feed(Coinbase(channels=[TICKER], symbols=['BTC-USD'], callbacks={TICKER: TickerZMQ(port=5678)}))
 
         f.run()
